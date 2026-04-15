@@ -9,7 +9,7 @@ from xml.etree import ElementTree as ET
 from .drawingml_context import ConvertContext
 from .drawingml_utils import (
     SVG_NS,
-    _extract_inheritable_styles, resolve_url_id,
+    XLINK_NS, _extract_inheritable_styles, resolve_url_id, parse_transform_components,
 )
 from .drawingml_styles import build_effect_xml
 from .drawingml_elements import (
@@ -30,23 +30,7 @@ def parse_transform(transform_str: str) -> tuple[float, float, float, float]:
     Returns:
         (dx, dy, sx, sy) tuple.
     """
-    if not transform_str:
-        return 0.0, 0.0, 1.0, 1.0
-
-    dx, dy = 0.0, 0.0
-    sx, sy = 1.0, 1.0
-
-    m = re.search(r'translate\(\s*([-\d.]+)[\s,]+([-\d.]+)\s*\)', transform_str)
-    if m:
-        dx = float(m.group(1))
-        dy = float(m.group(2))
-
-    m = re.search(r'scale\(\s*([-\d.]+)(?:[\s,]+([-\d.]+))?\s*\)', transform_str)
-    if m:
-        sx = float(m.group(1))
-        sy = float(m.group(2)) if m.group(2) else sx
-
-    return dx, dy, sx, sy
+    return parse_transform_components(transform_str)
 
 
 def _extract_shape_bounds_emu(shape_xml: str) -> tuple[int, int, int, int] | None:
@@ -146,6 +130,48 @@ def convert_g(elem: ET.Element, ctx: ConvertContext) -> str:
 </p:grpSp>'''
 
 
+def convert_use(elem: ET.Element, ctx: ConvertContext) -> str:
+    """Expand SVG <use> references by converting the referenced element."""
+    href = elem.get('href') or elem.get(f'{{{XLINK_NS}}}href') or ''
+    if not href.startswith('#'):
+        return ''
+
+    ref_id = href[1:]
+    ref_elem = ctx.defs.get(ref_id)
+    if ref_elem is None:
+        return ''
+
+    dx = dy = 0.0
+    use_x = elem.get('x')
+    use_y = elem.get('y')
+    if use_x is not None:
+        dx += float(use_x)
+    if use_y is not None:
+        dy += float(use_y)
+
+    tx, ty, sx, sy = parse_transform(elem.get('transform', ''))
+    dx += tx
+    dy += ty
+
+    filter_id = resolve_url_id(elem.get('filter', ''))
+    style_overrides = _extract_inheritable_styles(elem, ctx)
+    child_ctx = ctx.child(dx, dy, sx, sy, filter_id, style_overrides)
+
+    ref_tag = ref_elem.tag.replace(f'{{{SVG_NS}}}', '')
+    if ref_tag in ('g', 'symbol'):
+        child_shapes: list[str] = []
+        for child in ref_elem:
+            shape_xml = convert_element(child, child_ctx)
+            if shape_xml:
+                child_shapes.append(shape_xml)
+        ctx.sync_from_child(child_ctx)
+        return '\n'.join(child_shapes)
+
+    result = convert_element(ref_elem, child_ctx)
+    ctx.sync_from_child(child_ctx)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Defs collection & element dispatch
 # ---------------------------------------------------------------------------
@@ -163,23 +189,17 @@ _CONVERTERS = {
     'text': convert_text,
     'image': convert_image,
     'g': convert_g,
+    'use': convert_use,
 }
 
 
 def collect_defs(root: ET.Element) -> dict[str, ET.Element]:
-    """Collect all <defs> children into an {id: element} dictionary."""
+    """Collect all elements with an id into an {id: element} dictionary."""
     defs: dict[str, ET.Element] = {}
-    for defs_elem in root.iter(f'{{{SVG_NS}}}defs'):
-        for child in defs_elem:
-            elem_id = child.get('id')
-            if elem_id:
-                defs[elem_id] = child
-    # Also check for defs without namespace
-    for defs_elem in root.iter('defs'):
-        for child in defs_elem:
-            elem_id = child.get('id')
-            if elem_id:
-                defs[elem_id] = child
+    for elem in root.iter():
+        elem_id = elem.get('id')
+        if elem_id:
+            defs[elem_id] = elem
     return defs
 
 

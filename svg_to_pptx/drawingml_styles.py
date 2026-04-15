@@ -9,7 +9,8 @@ from .drawingml_context import ConvertContext
 from .drawingml_utils import (
     SVG_NS, ANGLE_UNIT, DASH_PRESETS,
     px_to_emu, _f, _get_attr,
-    parse_hex_color, parse_stop_style, resolve_url_id,
+    combine_opacity, normalize_dasharray,
+    parse_color_value, parse_hex_color, parse_stop_style, resolve_url_id,
 )
 
 
@@ -47,7 +48,10 @@ def build_gradient_fill(
         style = child.get('style', '')
         color, stop_opacity = parse_stop_style(style)
         if not color:
-            color = parse_hex_color(child.get('stop-color', '#000000'))
+            stop_color, stop_alpha = parse_color_value(child.get('stop-color', '#000000'))
+            color = stop_color
+            if stop_alpha is not None:
+                stop_opacity *= stop_alpha
         if color is None:
             color = '000000'
 
@@ -124,7 +128,10 @@ def build_fill_xml(
     if grad_id and grad_id in ctx.defs:
         return build_gradient_fill(ctx.defs[grad_id], opacity)
 
-    color = parse_hex_color(fill)
+    color, fill_alpha = parse_color_value(fill)
+    opacity = combine_opacity(opacity, fill_alpha)
+    if opacity is not None and opacity <= 0:
+        return '<a:noFill/>'
     if color:
         return build_solid_fill(color, opacity)
 
@@ -146,7 +153,7 @@ def build_stroke_xml(
 
     # Dash pattern
     dash_xml = ''
-    dasharray = _get_attr(elem, 'stroke-dasharray', ctx)
+    dasharray = normalize_dasharray(_get_attr(elem, 'stroke-dasharray', ctx) or '')
     if dasharray and dasharray != 'none':
         preset = DASH_PRESETS.get(dasharray.strip())
         if preset:
@@ -171,14 +178,25 @@ def build_stroke_xml(
     elif linejoin == 'miter':
         join_xml = '<a:miter lim="800000"/>'
 
+    marker_start = _get_attr(elem, 'marker-start', ctx)
+    marker_end = _get_attr(elem, 'marker-end', ctx)
+    marker_xml = ''
+    if marker_start and marker_start != 'none':
+        marker_xml += '<a:headEnd type="arrow" w="med" len="med"/>'
+    if marker_end and marker_end != 'none':
+        marker_xml += '<a:tailEnd type="arrow" w="med" len="med"/>'
+
     # Gradient stroke
     grad_id = resolve_url_id(stroke)
     if grad_id and grad_id in ctx.defs:
         grad_fill = build_gradient_fill(ctx.defs[grad_id], opacity)
-        return f'<a:ln w="{width_emu}"{cap_attr}>{grad_fill}{dash_xml}{join_xml}</a:ln>'
+        return f'<a:ln w="{width_emu}"{cap_attr}>{grad_fill}{dash_xml}{join_xml}{marker_xml}</a:ln>'
 
     # Solid color stroke
-    color = parse_hex_color(stroke)
+    color, stroke_alpha = parse_color_value(stroke)
+    opacity = combine_opacity(opacity, stroke_alpha)
+    if opacity is not None and opacity <= 0:
+        return '<a:ln><a:noFill/></a:ln>'
     if not color:
         return '<a:ln><a:noFill/></a:ln>'
 
@@ -187,7 +205,7 @@ def build_stroke_xml(
         alpha_xml = f'<a:alpha val="{int(opacity * 100000)}"/>'
 
     return f'''<a:ln w="{width_emu}"{cap_attr}>
-<a:solidFill><a:srgbClr val="{color}">{alpha_xml}</a:srgbClr></a:solidFill>{dash_xml}{join_xml}
+<a:solidFill><a:srgbClr val="{color}">{alpha_xml}</a:srgbClr></a:solidFill>{dash_xml}{join_xml}{marker_xml}
 </a:ln>'''
 
 

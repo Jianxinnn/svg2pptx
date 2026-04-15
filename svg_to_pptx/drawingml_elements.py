@@ -13,9 +13,10 @@ from .drawingml_utils import (
     SVG_NS, XLINK_NS, ANGLE_UNIT, FONT_PX_TO_HUNDREDTHS_PT, DASH_PRESETS,
     px_to_emu, _f, _get_attr,
     ctx_x, ctx_y, ctx_w, ctx_h,
-    parse_hex_color, resolve_url_id, get_effective_filter_id,
+    combine_opacity, parse_color_value, parse_hex_color,
+    resolve_url_id, get_effective_filter_id,
     parse_font_family, is_cjk_char, estimate_text_width,
-    _xml_escape,
+    _xml_escape, parse_transform_components, extract_transform_rotation_deg,
 )
 from .drawingml_styles import (
     build_solid_fill, build_gradient_fill,
@@ -194,22 +195,50 @@ def _wrap_shape(
 </p:sp>'''
 
 
+def _get_local_ctx(elem: ET.Element, ctx: ConvertContext) -> ConvertContext:
+    """Apply element-level translate/scale transforms as a temporary child context."""
+    dx, dy, sx, sy = parse_transform_components(elem.get('transform', ''))
+    if abs(dx) < 1e-8 and abs(dy) < 1e-8 and abs(sx - 1.0) < 1e-8 and abs(sy - 1.0) < 1e-8:
+        return ctx
+    return ctx.child(dx, dy, sx, sy)
+
+
+def _get_rotation_deg(elem: ET.Element) -> float:
+    """Extract an element's net transform rotation in degrees."""
+    return extract_transform_rotation_deg(elem.get('transform', ''))
+
+
+def _apply_text_fill_override(run_attrs: dict[str, Any], raw_fill: str | None) -> None:
+    """Apply a text fill override, preserving opacity from rgba() colors."""
+    if not raw_fill:
+        return
+
+    run_attrs['fill_raw'] = raw_fill
+    color, alpha = parse_color_value(raw_fill)
+    if color:
+        run_attrs['fill'] = color
+    if alpha is not None:
+        run_attrs['opacity'] = combine_opacity(run_attrs.get('opacity'), alpha)
+
+
 # ---------------------------------------------------------------------------
 # rect
 # ---------------------------------------------------------------------------
 
 def convert_rect(elem: ET.Element, ctx: ConvertContext) -> str:
     """Convert SVG <rect> to DrawingML shape."""
+    local_ctx = _get_local_ctx(elem, ctx)
+
     pattern_id = resolve_url_id(_get_attr(elem, 'fill', ctx) or '')
     if pattern_id:
-        pattern_xml = _pattern_circle_fill_group(elem, ctx, pattern_id)
+        pattern_xml = _pattern_circle_fill_group(elem, local_ctx, pattern_id)
         if pattern_xml:
             return pattern_xml
 
-    x = ctx_x(_f(elem.get('x')), ctx)
-    y = ctx_y(_f(elem.get('y')), ctx)
-    w = ctx_w(_f(elem.get('width')), ctx)
-    h = ctx_h(_f(elem.get('height')), ctx)
+    x = ctx_x(_f(elem.get('x')), local_ctx)
+    y = ctx_y(_f(elem.get('y')), local_ctx)
+    w = ctx_w(_f(elem.get('width')), local_ctx)
+    h = ctx_h(_f(elem.get('height')), local_ctx)
 
     if w <= 0 or h <= 0:
         return ''
@@ -224,14 +253,14 @@ def convert_rect(elem: ET.Element, ctx: ConvertContext) -> str:
     if filt_id and filt_id in ctx.defs:
         effect = build_effect_xml(ctx.defs[filt_id])
 
-    rot = 0
-    transform = elem.get('transform')
-    if transform:
-        r_match = re.search(r'rotate\(\s*([-\d.]+)', transform)
-        if r_match:
-            rot = int(float(r_match.group(1)) * ANGLE_UNIT)
+    rot = int(_get_rotation_deg(elem) * ANGLE_UNIT)
 
-    geom = '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+    rx = max(_f(elem.get('rx')), _f(elem.get('ry')))
+    geom = (
+        '<a:prstGeom prst="roundRect"><a:avLst/></a:prstGeom>'
+        if rx > 0
+        else '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+    )
 
     shape_id = ctx.next_id()
     return _wrap_shape(
@@ -344,6 +373,7 @@ def _is_donut_circle(elem: ET.Element, ctx: ConvertContext) -> bool:
 
 def convert_circle(elem: ET.Element, ctx: ConvertContext) -> str:
     """Convert SVG <circle> to DrawingML ellipse or donut-arc shape."""
+    local_ctx = _get_local_ctx(elem, ctx)
     cx_ = _f(elem.get('cx'))
     cy_ = _f(elem.get('cy'))
     r = _f(elem.get('r'))
@@ -359,17 +389,13 @@ def convert_circle(elem: ET.Element, ctx: ConvertContext) -> str:
         dash_offset = _f(elem.get('stroke-dashoffset'), 0)
         stroke_width = _f(_get_attr(elem, 'stroke-width', ctx), 1)
 
-        rotate_deg = 0.0
-        transform = elem.get('transform', '')
-        r_match = re.search(r'rotate\(\s*([-\d.]+)', transform)
-        if r_match:
-            rotate_deg = float(r_match.group(1))
+        rotate_deg = _get_rotation_deg(elem)
 
         geom, min_x, min_y, w_emu, h_emu = _build_arc_ring_path(
-            ctx_x(cx_, ctx) / ctx.scale_x,
-            ctx_y(cy_, ctx) / ctx.scale_y,
+            ctx_x(cx_, local_ctx) / local_ctx.scale_x,
+            ctx_y(cy_, local_ctx) / local_ctx.scale_y,
             r, stroke_width, dash_len, dash_offset, rotate_deg,
-            ctx.scale_x, ctx.scale_y,
+            local_ctx.scale_x, local_ctx.scale_y,
         )
         if not geom:
             return ''
@@ -401,10 +427,10 @@ def convert_circle(elem: ET.Element, ctx: ConvertContext) -> str:
         )
 
     # --- Normal circle ---
-    cx_s = ctx_x(cx_, ctx)
-    cy_s = ctx_y(cy_, ctx)
-    r_x = r * ctx.scale_x
-    r_y = r * ctx.scale_y
+    cx_s = ctx_x(cx_, local_ctx)
+    cy_s = ctx_y(cy_, local_ctx)
+    r_x = r * local_ctx.scale_x
+    r_y = r * local_ctx.scale_y
 
     x = cx_s - r_x
     y = cy_s - r_y
@@ -437,10 +463,11 @@ def convert_circle(elem: ET.Element, ctx: ConvertContext) -> str:
 
 def convert_line(elem: ET.Element, ctx: ConvertContext) -> str:
     """Convert SVG <line> to DrawingML custom geometry shape."""
-    x1 = ctx_x(_f(elem.get('x1')), ctx)
-    y1 = ctx_y(_f(elem.get('y1')), ctx)
-    x2 = ctx_x(_f(elem.get('x2')), ctx)
-    y2 = ctx_y(_f(elem.get('y2')), ctx)
+    local_ctx = _get_local_ctx(elem, ctx)
+    x1 = ctx_x(_f(elem.get('x1')), local_ctx)
+    y1 = ctx_y(_f(elem.get('y1')), local_ctx)
+    x2 = ctx_x(_f(elem.get('x2')), local_ctx)
+    y2 = ctx_y(_f(elem.get('y2')), local_ctx)
 
     min_x = min(x1, x2)
     min_y = min(y1, y2)
@@ -467,12 +494,7 @@ def convert_line(elem: ET.Element, ctx: ConvertContext) -> str:
     stroke_op = get_stroke_opacity(elem, ctx)
     stroke = build_stroke_xml(elem, ctx, stroke_op)
 
-    rot = 0
-    transform = elem.get('transform')
-    if transform:
-        r_match = re.search(r'rotate\(\s*([-\d.]+)', transform)
-        if r_match:
-            rot = int(float(r_match.group(1)) * ANGLE_UNIT)
+    rot = int(_get_rotation_deg(elem) * ANGLE_UNIT)
 
     shape_id = ctx.next_id()
     return _wrap_shape(
@@ -488,6 +510,7 @@ def convert_line(elem: ET.Element, ctx: ConvertContext) -> str:
 
 def convert_path(elem: ET.Element, ctx: ConvertContext) -> str:
     """Convert SVG <path> to DrawingML custom geometry shape."""
+    local_ctx = _get_local_ctx(elem, ctx)
     d = elem.get('d', '')
     if not d:
         return ''
@@ -511,9 +534,9 @@ def convert_path(elem: ET.Element, ctx: ConvertContext) -> str:
 
         shapes = [
             _make_circle_shape(
-                ctx_x(cx, ctx),
-                ctx_y(cy, ctx),
-                r * max(ctx.scale_x, ctx.scale_y),
+                ctx_x(cx, local_ctx),
+                ctx_y(cy, local_ctx),
+                r * max(local_ctx.scale_x, local_ctx.scale_y),
                 ctx,
                 dot_fill,
                 name_prefix='Path Dot',
@@ -523,21 +546,11 @@ def convert_path(elem: ET.Element, ctx: ConvertContext) -> str:
         if shapes:
             return '\n'.join(shapes)
 
-    tx, ty = 0.0, 0.0
-    rot = 0
-    transform = elem.get('transform')
-    if transform:
-        t_match = re.search(r'translate\(\s*([-\d.]+)[\s,]+([-\d.]+)\s*\)', transform)
-        if t_match:
-            tx = float(t_match.group(1))
-            ty = float(t_match.group(2))
-        r_match = re.search(r'rotate\(\s*([-\d.]+)', transform)
-        if r_match:
-            rot = int(float(r_match.group(1)) * ANGLE_UNIT)
+    rot = int(_get_rotation_deg(elem) * ANGLE_UNIT)
 
     path_xml, min_x, min_y, width, height = path_commands_to_drawingml(
-        commands, ctx.translate_x + tx, ctx.translate_y + ty,
-        ctx.scale_x, ctx.scale_y,
+        commands, local_ctx.translate_x, local_ctx.translate_y,
+        local_ctx.scale_x, local_ctx.scale_y,
     )
 
     if not path_xml:
@@ -586,6 +599,7 @@ def _parse_points(points_str: str) -> list[tuple[float, float]]:
 
 def convert_polygon(elem: ET.Element, ctx: ConvertContext) -> str:
     """Convert SVG <polygon> to DrawingML custom geometry shape."""
+    local_ctx = _get_local_ctx(elem, ctx)
     points = _parse_points(elem.get('points', ''))
     if not points:
         return ''
@@ -596,8 +610,8 @@ def convert_polygon(elem: ET.Element, ctx: ConvertContext) -> str:
     commands.append(PathCommand('Z', []))
 
     path_xml, min_x, min_y, width, height = path_commands_to_drawingml(
-        commands, ctx.translate_x, ctx.translate_y,
-        ctx.scale_x, ctx.scale_y,
+        commands, local_ctx.translate_x, local_ctx.translate_y,
+        local_ctx.scale_x, local_ctx.scale_y,
     )
 
     if not path_xml:
@@ -619,12 +633,7 @@ def convert_polygon(elem: ET.Element, ctx: ConvertContext) -> str:
     fill = build_fill_xml(elem, ctx, fill_op)
     stroke = build_stroke_xml(elem, ctx, stroke_op)
 
-    rot = 0
-    transform = elem.get('transform')
-    if transform:
-        r_match = re.search(r'rotate\(\s*([-\d.]+)', transform)
-        if r_match:
-            rot = int(float(r_match.group(1)) * ANGLE_UNIT)
+    rot = int(_get_rotation_deg(elem) * ANGLE_UNIT)
 
     shape_id = ctx.next_id()
     return _wrap_shape(
@@ -636,6 +645,7 @@ def convert_polygon(elem: ET.Element, ctx: ConvertContext) -> str:
 
 def convert_polyline(elem: ET.Element, ctx: ConvertContext) -> str:
     """Convert SVG <polyline> to DrawingML custom geometry shape."""
+    local_ctx = _get_local_ctx(elem, ctx)
     points = _parse_points(elem.get('points', ''))
     if not points:
         return ''
@@ -645,8 +655,8 @@ def convert_polyline(elem: ET.Element, ctx: ConvertContext) -> str:
         commands.append(PathCommand('L', [px_, py_]))
 
     path_xml, min_x, min_y, width, height = path_commands_to_drawingml(
-        commands, ctx.translate_x, ctx.translate_y,
-        ctx.scale_x, ctx.scale_y,
+        commands, local_ctx.translate_x, local_ctx.translate_y,
+        local_ctx.scale_x, local_ctx.scale_y,
     )
 
     if not path_xml:
@@ -668,12 +678,7 @@ def convert_polyline(elem: ET.Element, ctx: ConvertContext) -> str:
     fill = build_fill_xml(elem, ctx, fill_op)
     stroke = build_stroke_xml(elem, ctx, stroke_op)
 
-    rot = 0
-    transform = elem.get('transform')
-    if transform:
-        r_match = re.search(r'rotate\(\s*([-\d.]+)', transform)
-        if r_match:
-            rot = int(float(r_match.group(1)) * ANGLE_UNIT)
+    rot = int(_get_rotation_deg(elem) * ANGLE_UNIT)
 
     shape_id = ctx.next_id()
     return _wrap_shape(
@@ -719,11 +724,7 @@ def _build_text_runs(
                 if child.get('font-weight'):
                     run_attrs['font_weight'] = child.get('font-weight')
                 if child.get('fill'):
-                    child_fill = child.get('fill')
-                    run_attrs['fill_raw'] = child_fill
-                    c = parse_hex_color(child_fill)
-                    if c:
-                        run_attrs['fill'] = c
+                    _apply_text_fill_override(run_attrs, child.get('fill'))
                 if child.get('font-size'):
                     run_attrs['font_size'] = _f(child.get('font-size'), run_attrs['font_size'])
                 if child.get('font-family'):
@@ -741,6 +742,28 @@ def _build_text_runs(
                     runs.append({**parent_attrs, 'text': t})
 
     return runs
+
+
+def _merge_text_run_attrs(
+    parent_attrs: dict[str, Any],
+    elem: ET.Element,
+    scale_y: float = 1.0,
+) -> dict[str, Any]:
+    """Merge <text>/<tspan> presentation overrides into a run attribute dict."""
+    run_attrs = dict(parent_attrs)
+    if elem.get('font-weight'):
+        run_attrs['font_weight'] = elem.get('font-weight')
+    if elem.get('fill'):
+        _apply_text_fill_override(run_attrs, elem.get('fill'))
+    if elem.get('font-size'):
+        run_attrs['font_size'] = _f(elem.get('font-size'), run_attrs['font_size'] / max(scale_y, 1e-8)) * scale_y
+    if elem.get('font-family'):
+        run_attrs['font_family'] = elem.get('font-family')
+    if elem.get('font-style'):
+        run_attrs['font_style'] = elem.get('font-style')
+    if elem.get('text-decoration'):
+        run_attrs['text_decoration'] = elem.get('text-decoration')
+    return run_attrs
 
 
 def _build_run_xml(
@@ -789,34 +812,17 @@ def _build_run_xml(
 </a:r>'''
 
 
-def convert_text(elem: ET.Element, ctx: ConvertContext) -> str:
-    """Convert SVG <text> to DrawingML text shape with multi-run support."""
-    x = ctx_x(_f(elem.get('x')), ctx)
-    y = ctx_y(_f(elem.get('y')), ctx)
-    font_size = _f(_get_attr(elem, 'font-size', ctx), 16) * ctx.scale_y
-    font_weight = _get_attr(elem, 'font-weight', ctx) or '400'
-    font_family_str = _get_attr(elem, 'font-family', ctx) or ''
-    text_anchor = _get_attr(elem, 'text-anchor', ctx) or 'start'
-    fill_raw = _get_attr(elem, 'fill', ctx) or '#000000'
-    fill_color = parse_hex_color(fill_raw) or '000000'
-    opacity = get_fill_opacity(elem, ctx)
-    font_style = _get_attr(elem, 'font-style', ctx) or ''
-    text_decoration = _get_attr(elem, 'text-decoration', ctx) or ''
-
-    fonts = parse_font_family(font_family_str)
-
-    parent_attrs: dict[str, Any] = {
-        'fill': fill_color,
-        'fill_raw': fill_raw,
-        'font_weight': font_weight,
-        'font_size': font_size,
-        'font_family': font_family_str,
-        'font_style': font_style,
-        'text_decoration': text_decoration,
-        'opacity': opacity,
-    }
-    runs = _build_text_runs(elem, parent_attrs)
-
+def _build_text_shape(
+    x: float,
+    y: float,
+    runs: list[dict[str, Any]],
+    text_anchor: str,
+    fonts: dict[str, str],
+    ctx: ConvertContext,
+    effect_xml: str = '',
+    text_rot: int = 0,
+) -> str:
+    """Build a single positioned DrawingML textbox."""
     if not runs:
         return ''
 
@@ -824,12 +830,15 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> str:
     if not full_text.strip():
         return ''
 
-    # Estimate text dimensions
-    text_width = estimate_text_width(full_text, font_size, font_weight) * 1.15
+    font_size = max(float(r.get('font_size', 16)) for r in runs)
+    font_weight = str(runs[0].get('font_weight', '400'))
+    text_width = max(
+        estimate_text_width(str(r['text']), float(r.get('font_size', font_size)), str(r.get('font_weight', font_weight)))
+        for r in runs
+    ) * 1.15
     text_height = font_size * 1.5
     padding = font_size * 0.1
 
-    # Adjust position based on text-anchor
     if text_anchor == 'middle':
         box_x = x - text_width / 2 - padding
     elif text_anchor == 'end':
@@ -841,37 +850,11 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> str:
     box_w = text_width + padding * 2
     box_h = text_height + padding
 
-    # Letter spacing
-    spc_attr = ''
-    letter_spacing = _get_attr(elem, 'letter-spacing', ctx)
-    if letter_spacing:
-        try:
-            spc_val = float(letter_spacing) * 100
-            spc_attr = f' spc="{int(spc_val)}"'
-        except ValueError:
-            pass
-
-    # Text rotation
-    text_rot = 0
-    text_transform = elem.get('transform', '')
-    if text_transform:
-        rot_match = re.search(r'rotate\(\s*([-\d.]+)', text_transform)
-        if rot_match:
-            text_rot = int(float(rot_match.group(1)) * ANGLE_UNIT)
-
-    # Alignment
     algn_map = {'start': 'l', 'middle': 'ctr', 'end': 'r'}
     algn = algn_map.get(text_anchor, 'l')
 
-    # Shadow effect
-    effect_xml = ''
-    filt_id = get_effective_filter_id(elem, ctx)
-    if filt_id and filt_id in ctx.defs:
-        effect_xml = build_effect_xml(ctx.defs[filt_id])
-
     shape_id = ctx.next_id()
     rot_attr = f' rot="{text_rot}"' if text_rot else ''
-
     runs_xml = '\n'.join(_build_run_xml(r, fonts, ctx) for r in runs)
 
     return f'''<p:sp>
@@ -900,20 +883,135 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> str:
 </p:sp>'''
 
 
+def convert_text(elem: ET.Element, ctx: ConvertContext) -> str:
+    """Convert SVG <text> to DrawingML text shape with multi-run support."""
+    local_ctx = _get_local_ctx(elem, ctx)
+    x = ctx_x(_f(elem.get('x')), local_ctx)
+    y = ctx_y(_f(elem.get('y')), local_ctx)
+    font_size = _f(_get_attr(elem, 'font-size', local_ctx), 16) * local_ctx.scale_y
+    font_weight = _get_attr(elem, 'font-weight', ctx) or '400'
+    font_family_str = _get_attr(elem, 'font-family', ctx) or ''
+    text_anchor = _get_attr(elem, 'text-anchor', ctx) or 'start'
+    fill_raw = _get_attr(elem, 'fill', ctx) or '#000000'
+    fill_color, fill_alpha = parse_color_value(fill_raw)
+    opacity = combine_opacity(get_fill_opacity(elem, ctx), fill_alpha)
+    font_style = _get_attr(elem, 'font-style', ctx) or ''
+    text_decoration = _get_attr(elem, 'text-decoration', ctx) or ''
+
+    fonts = parse_font_family(font_family_str)
+
+    parent_attrs: dict[str, Any] = {
+        'fill': fill_color or '000000',
+        'fill_raw': fill_raw,
+        'font_weight': font_weight,
+        'font_size': font_size,
+        'font_family': font_family_str,
+        'font_style': font_style,
+        'text_decoration': text_decoration,
+        'opacity': opacity,
+    }
+    runs = _build_text_runs(elem, parent_attrs)
+
+    if not runs:
+        return ''
+
+    text_rot = int(_get_rotation_deg(elem) * ANGLE_UNIT)
+
+    # Shadow effect
+    effect_xml = ''
+    filt_id = get_effective_filter_id(elem, ctx)
+    if filt_id and filt_id in ctx.defs:
+        effect_xml = build_effect_xml(ctx.defs[filt_id])
+
+    positioned_tspans = [
+        child for child in elem
+        if child.tag.replace(f'{{{SVG_NS}}}', '') == 'tspan'
+        and any(child.get(attr) is not None for attr in ('x', 'y', 'dx', 'dy'))
+    ]
+    if positioned_tspans:
+        text_boxes: list[str] = []
+
+        if elem.text:
+            base_text = _normalize_text(elem.text)
+            if base_text:
+                text_boxes.append(
+                    _build_text_shape(
+                        x, y,
+                        [{**parent_attrs, 'text': base_text}],
+                        text_anchor,
+                        fonts,
+                        ctx,
+                        effect_xml=effect_xml,
+                        text_rot=text_rot,
+                    )
+                )
+
+        current_x = _f(elem.get('x'))
+        current_y = _f(elem.get('y'))
+        for child in positioned_tspans:
+            run_attrs = _merge_text_run_attrs(parent_attrs, child, local_ctx.scale_y)
+            if child.get('x') is not None:
+                current_x = _f(child.get('x'))
+            if child.get('y') is not None:
+                current_y = _f(child.get('y'))
+            if child.get('dx') is not None:
+                current_x += _f(child.get('dx'))
+            if child.get('dy') is not None:
+                current_y += _f(child.get('dy'))
+
+            child_text = _normalize_text(''.join(child.itertext()))
+            if child_text:
+                text_boxes.append(
+                    _build_text_shape(
+                        ctx_x(current_x, local_ctx),
+                        ctx_y(current_y, local_ctx),
+                        [{**run_attrs, 'text': child_text}],
+                        text_anchor,
+                        fonts,
+                        ctx,
+                        effect_xml=effect_xml,
+                        text_rot=text_rot,
+                    )
+                )
+
+            if child.tail:
+                tail_text = _normalize_text(child.tail)
+                if tail_text:
+                    text_boxes.append(
+                        _build_text_shape(
+                            ctx_x(current_x, local_ctx),
+                            ctx_y(current_y, local_ctx),
+                            [{**parent_attrs, 'text': tail_text}],
+                            text_anchor,
+                            fonts,
+                            ctx,
+                            effect_xml=effect_xml,
+                            text_rot=text_rot,
+                        )
+                    )
+
+        return '\n'.join(box for box in text_boxes if box)
+
+    return _build_text_shape(
+        x, y, runs, text_anchor, fonts, ctx, effect_xml=effect_xml, text_rot=text_rot,
+    )
+
+
 # ---------------------------------------------------------------------------
 # image
 # ---------------------------------------------------------------------------
 
 def convert_image(elem: ET.Element, ctx: ConvertContext) -> str:
     """Convert SVG <image> to DrawingML picture element."""
+    local_ctx = _get_local_ctx(elem, ctx)
     href = elem.get('href') or elem.get(f'{{{XLINK_NS}}}href')
     if not href:
         return ''
 
-    x = ctx_x(_f(elem.get('x')), ctx)
-    y = ctx_y(_f(elem.get('y')), ctx)
-    w = ctx_w(_f(elem.get('width')), ctx)
-    h = ctx_h(_f(elem.get('height')), ctx)
+    x = ctx_x(_f(elem.get('x')), local_ctx)
+    y = ctx_y(_f(elem.get('y')), local_ctx)
+    w = ctx_w(_f(elem.get('width')), local_ctx)
+    h = ctx_h(_f(elem.get('height')), local_ctx)
 
     if w <= 0 or h <= 0:
         return ''
@@ -952,12 +1050,7 @@ def convert_image(elem: ET.Element, ctx: ConvertContext) -> str:
         'target': f'../media/{img_filename}',
     })
 
-    rot = 0
-    transform = elem.get('transform')
-    if transform:
-        r_match = re.search(r'rotate\(\s*([-\d.]+)', transform)
-        if r_match:
-            rot = int(float(r_match.group(1)) * ANGLE_UNIT)
+    rot = int(_get_rotation_deg(elem) * ANGLE_UNIT)
     rot_attr = f' rot="{rot}"' if rot else ''
 
     shape_id = ctx.next_id()
@@ -986,10 +1079,11 @@ def convert_image(elem: ET.Element, ctx: ConvertContext) -> str:
 
 def convert_ellipse(elem: ET.Element, ctx: ConvertContext) -> str:
     """Convert SVG <ellipse> to DrawingML ellipse shape."""
-    cx_ = ctx_x(_f(elem.get('cx')), ctx)
-    cy_ = ctx_y(_f(elem.get('cy')), ctx)
-    rx = _f(elem.get('rx')) * ctx.scale_x
-    ry = _f(elem.get('ry')) * ctx.scale_y
+    local_ctx = _get_local_ctx(elem, ctx)
+    cx_ = ctx_x(_f(elem.get('cx')), local_ctx)
+    cy_ = ctx_y(_f(elem.get('cy')), local_ctx)
+    rx = _f(elem.get('rx')) * local_ctx.scale_x
+    ry = _f(elem.get('ry')) * local_ctx.scale_y
 
     if rx <= 0 or ry <= 0:
         return ''
@@ -1006,12 +1100,7 @@ def convert_ellipse(elem: ET.Element, ctx: ConvertContext) -> str:
 
     geom = '<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>'
 
-    rot = 0
-    transform = elem.get('transform')
-    if transform:
-        r_match = re.search(r'rotate\(\s*([-\d.]+)', transform)
-        if r_match:
-            rot = int(float(r_match.group(1)) * ANGLE_UNIT)
+    rot = int(_get_rotation_deg(elem) * ANGLE_UNIT)
 
     shape_id = ctx.next_id()
     return _wrap_shape(

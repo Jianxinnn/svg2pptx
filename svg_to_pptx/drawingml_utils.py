@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from xml.etree import ElementTree as ET
 
@@ -93,6 +94,23 @@ GENERIC_FONT_MAP = {
     'serif': 'Times New Roman',
 }
 
+COLOR_KEYWORDS = {
+    'black': '000000',
+    'white': 'FFFFFF',
+    'red': 'FF0000',
+    'green': '008000',
+    'blue': '0000FF',
+    'yellow': 'FFFF00',
+    'gray': '808080',
+    'grey': '808080',
+    'orange': 'FFA500',
+    'purple': '800080',
+    'pink': 'FFC0CB',
+    'brown': 'A52A2A',
+}
+
+_NUMBER_RE = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+
 # When the latin font is serif and no EA font is specified,
 # prefer SimSun (serif CJK) over Microsoft YaHei (sans-serif CJK).
 _SERIF_LATIN = {
@@ -123,10 +141,51 @@ def _f(val: str | None, default: float = 0.0) -> float:
     """Parse a float attribute value, returning default if missing."""
     if val is None:
         return default
-    try:
+    if isinstance(val, (int, float)):
         return float(val)
-    except (ValueError, TypeError):
+    text = str(val).strip()
+    if not text:
         return default
+    try:
+        return float(text)
+    except (ValueError, TypeError):
+        pass
+
+    match = _NUMBER_RE.match(text)
+    if not match:
+        return default
+
+    try:
+        number = float(match.group(0))
+    except ValueError:
+        return default
+
+    if text.endswith('%'):
+        return number / 100.0
+    return number
+
+
+def _parse_style_declarations(style_attr: str) -> dict[str, str]:
+    """Parse a CSS declaration string into a property map."""
+    styles: dict[str, str] = {}
+    if not style_attr:
+        return styles
+
+    for part in style_attr.split(';'):
+        if ':' not in part:
+            continue
+        key, val = part.split(':', 1)
+        key = key.strip()
+        val = val.strip()
+        if key:
+            styles[key] = val
+    return styles
+
+
+def _should_fallback_to_style(attr: str, value: str) -> bool:
+    """Whether an explicit SVG attribute should defer to inline/class style."""
+    stripped = value.strip()
+    return attr in ('fill', 'stroke', 'color') and stripped.startswith('var(')
 
 
 def _extract_inheritable_styles(
@@ -138,17 +197,7 @@ def _extract_inheritable_styles(
 
     # Inline style has higher priority than class style but lower than
     # explicit presentation attributes.
-    inline_styles: dict[str, str] = {}
-    style_attr = elem.get('style', '')
-    if style_attr:
-        for part in style_attr.split(';'):
-            if ':' not in part:
-                continue
-            key, val = part.split(':', 1)
-            key = key.strip()
-            val = val.strip()
-            if key:
-                inline_styles[key] = val
+    inline_styles = _parse_style_declarations(elem.get('style', ''))
 
     class_styles: dict[str, str] = {}
     class_attr = elem.get('class', '')
@@ -160,7 +209,7 @@ def _extract_inheritable_styles(
 
     for attr in INHERITABLE_ATTRS:
         val = elem.get(attr)
-        if val is not None:
+        if val is not None and not _should_fallback_to_style(attr, val):
             styles[attr] = val
             continue
         if attr in inline_styles:
@@ -168,24 +217,22 @@ def _extract_inheritable_styles(
             continue
         if attr in class_styles:
             styles[attr] = class_styles[attr]
+            continue
+        if val is not None:
+            styles[attr] = val
     return styles
 
 
 def _get_attr(elem: ET.Element, attr: str, ctx: ConvertContext) -> str | None:
     """Get effective attribute: element's own value first, then inherited."""
     val = elem.get(attr)
-    if val is not None:
+    if val is not None and not _should_fallback_to_style(attr, val):
         return val
 
     # style="a:b;c:d"
-    style_attr = elem.get('style', '')
-    if style_attr:
-        for part in style_attr.split(';'):
-            if ':' not in part:
-                continue
-            key, style_val = part.split(':', 1)
-            if key.strip() == attr:
-                return style_val.strip()
+    style_map = _parse_style_declarations(elem.get('style', ''))
+    if attr in style_map:
+        return style_map[attr]
 
     # class="foo bar"
     class_attr = elem.get('class', '')
@@ -194,6 +241,9 @@ def _get_attr(elem: ET.Element, attr: str, ctx: ConvertContext) -> str | None:
             cls_map = ctx.class_styles.get(cls)
             if cls_map and attr in cls_map:
                 return cls_map[attr]
+
+    if val is not None:
+        return val
 
     return ctx.inherited_styles.get(attr)
 
@@ -218,22 +268,201 @@ def ctx_h(val: float, ctx: ConvertContext) -> float:
     return val * ctx.scale_y
 
 
+def multiply_svg_matrices(
+    left: tuple[float, float, float, float, float, float],
+    right: tuple[float, float, float, float, float, float],
+) -> tuple[float, float, float, float, float, float]:
+    """Multiply two SVG affine matrices."""
+    a1, b1, c1, d1, e1, f1 = left
+    a2, b2, c2, d2, e2, f2 = right
+    return (
+        a1 * a2 + c1 * b2,
+        b1 * a2 + d1 * b2,
+        a1 * c2 + c1 * d2,
+        b1 * c2 + d1 * d2,
+        a1 * e2 + c1 * f2 + e1,
+        b1 * e2 + d1 * f2 + f1,
+    )
+
+
+def parse_transform_matrix(transform_str: str) -> tuple[float, float, float, float, float, float]:
+    """Parse an SVG transform string into an affine matrix.
+
+    Returns (a, b, c, d, e, f) for:
+      [a c e]
+      [b d f]
+      [0 0 1]
+    """
+    if not transform_str:
+        return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+    matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    for name, raw_args in re.findall(r'([A-Za-z]+)\(([^)]*)\)', transform_str):
+        args = [
+            float(token)
+            for token in re.findall(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?', raw_args)
+        ]
+        op = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+        if name == 'matrix' and len(args) == 6:
+            op = tuple(args)  # type: ignore[assignment]
+        elif name == 'translate' and args:
+            tx = args[0]
+            ty = args[1] if len(args) > 1 else 0.0
+            op = (1.0, 0.0, 0.0, 1.0, tx, ty)
+        elif name == 'scale' and args:
+            sx = args[0]
+            sy = args[1] if len(args) > 1 else sx
+            op = (sx, 0.0, 0.0, sy, 0.0, 0.0)
+        elif name == 'rotate' and args:
+            angle = math.radians(args[0])
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            rot = (cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0)
+            if len(args) >= 3:
+                cx = args[1]
+                cy = args[2]
+                op = multiply_svg_matrices(
+                    multiply_svg_matrices((1.0, 0.0, 0.0, 1.0, cx, cy), rot),
+                    (1.0, 0.0, 0.0, 1.0, -cx, -cy),
+                )
+            else:
+                op = rot
+        elif name == 'skewX' and args:
+            op = (1.0, 0.0, math.tan(math.radians(args[0])), 1.0, 0.0, 0.0)
+        elif name == 'skewY' and args:
+            op = (1.0, math.tan(math.radians(args[0])), 0.0, 1.0, 0.0, 0.0)
+
+        matrix = multiply_svg_matrices(matrix, op)
+
+    return matrix
+
+
+def parse_transform_components(transform_str: str) -> tuple[float, float, float, float]:
+    """Extract axis-aligned translate/scale components from an SVG transform."""
+    a, b, c, d, e, f = parse_transform_matrix(transform_str)
+    sx = math.copysign(math.hypot(a, b), a if abs(a) >= abs(b) else b or 1.0)
+    sy = math.copysign(math.hypot(c, d), d if abs(d) >= abs(c) else c or 1.0)
+    if abs(b) < 1e-8 and abs(c) < 1e-8:
+        sx = a if abs(a) > 1e-8 else sx
+        sy = d if abs(d) > 1e-8 else sy
+    return e, f, sx or 1.0, sy or 1.0
+
+
+def extract_transform_rotation_deg(transform_str: str) -> float:
+    """Extract net rotation in degrees from an SVG transform."""
+    if not transform_str:
+        return 0.0
+    a, b, _, _, _, _ = parse_transform_matrix(transform_str)
+    return math.degrees(math.atan2(b, a))
+
+
 # ---------------------------------------------------------------------------
 # Color / style parsing
 # ---------------------------------------------------------------------------
 
-def parse_hex_color(color_str: str) -> str | None:
-    """Parse '#RRGGBB' or '#RGB' to 'RRGGBB'. Returns None on failure."""
-    if not color_str:
+def _parse_rgb_channel(channel: str) -> int | None:
+    """Parse a single CSS rgb channel into an 8-bit integer."""
+    channel = channel.strip()
+    if not channel:
         return None
+    try:
+        if channel.endswith('%'):
+            return max(0, min(255, round(float(channel[:-1]) * 2.55)))
+        return max(0, min(255, round(float(channel))))
+    except ValueError:
+        return None
+
+
+def _parse_alpha_channel(alpha: str) -> float | None:
+    """Parse a CSS alpha value."""
+    alpha = alpha.strip()
+    if not alpha:
+        return None
+    try:
+        if alpha.endswith('%'):
+            return max(0.0, min(1.0, float(alpha[:-1]) / 100.0))
+        return max(0.0, min(1.0, float(alpha)))
+    except ValueError:
+        return None
+
+
+def parse_color_value(color_str: str) -> tuple[str | None, float | None]:
+    """Parse an SVG/CSS color into ('RRGGBB', alpha)."""
+    if not color_str:
+        return None, None
+
     color_str = color_str.strip()
+    lower = color_str.lower()
+
+    if lower == 'none':
+        return None, None
+    if lower == 'transparent':
+        return '000000', 0.0
+
     if color_str.startswith('#'):
-        color_str = color_str[1:]
-    if len(color_str) == 3:
-        color_str = ''.join(c * 2 for c in color_str)
-    if len(color_str) == 6 and all(c in '0123456789abcdefABCDEF' for c in color_str):
-        return color_str.upper()
-    return None
+        hex_color = color_str[1:]
+        if len(hex_color) == 3:
+            hex_color = ''.join(c * 2 for c in hex_color)
+        if len(hex_color) == 6 and all(c in '0123456789abcdefABCDEF' for c in hex_color):
+            return hex_color.upper(), None
+        return None, None
+
+    keyword = COLOR_KEYWORDS.get(lower)
+    if keyword:
+        return keyword, None
+
+    rgb_match = re.fullmatch(r'rgba?\(([^)]+)\)', color_str, flags=re.IGNORECASE)
+    if not rgb_match:
+        return None, None
+
+    parts = [
+        part for part in re.split(r'\s*,\s*|\s+', rgb_match.group(1).strip())
+        if part and part != '/'
+    ]
+    if len(parts) not in (3, 4):
+        return None, None
+
+    rgb = [_parse_rgb_channel(part) for part in parts[:3]]
+    if any(part is None for part in rgb):
+        return None, None
+
+    alpha = _parse_alpha_channel(parts[3]) if len(parts) == 4 else None
+    return ''.join(f'{int(part):02X}' for part in rgb if part is not None), alpha
+
+
+def parse_hex_color(color_str: str) -> str | None:
+    """Parse common SVG/CSS color formats to 'RRGGBB'."""
+    color, _ = parse_color_value(color_str)
+    return color
+
+
+def combine_opacity(base: float | None, extra: float | None) -> float | None:
+    """Combine two opacity values multiplicatively."""
+    if base is None:
+        return extra
+    if extra is None:
+        return base
+    return base * extra
+
+
+def normalize_dasharray(dasharray_str: str) -> str:
+    """Normalize CSS dasharray values like '4px, 3px' to '4 3'."""
+    if not dasharray_str:
+        return ''
+
+    values: list[str] = []
+    for part in re.split(r'[\s,]+', dasharray_str.strip()):
+        if not part:
+            continue
+        parsed = _f(part, math.nan)
+        if math.isnan(parsed):
+            return dasharray_str.strip()
+        if abs(parsed - round(parsed)) < 1e-8:
+            values.append(str(int(round(parsed))))
+        else:
+            values.append(f'{parsed:.3f}'.rstrip('0').rstrip('.'))
+    return ' '.join(values)
 
 
 def parse_stop_style(style_str: str) -> tuple[str | None, float]:
